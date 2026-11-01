@@ -687,6 +687,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
         # model before the turn runs (#29923 review defect). Any config.yaml change is adopted on the NEXT
         # turn, after the finally-restore below.
         _apply_pending_model_switch(sid, session)
+        _restore_auth_fallback_primary(sid, session)  # outage chat: back to its intended route once it resolves
         _sync_agent_model_with_config(sid, session)
         _sync_agent_compression_with_config(sid, session)
     _sync_agent_fallback_with_config(sid, session)  # chain added after the chat opened reaches this turn

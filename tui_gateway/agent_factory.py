@@ -165,6 +165,12 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
             # The route is gone with its endpoint and wire: on the default provider they would send
             # that provider's credentials to the stored URL.
             provider = base_url = api_mode = ""
+    if isinstance(marker := model_config.get("auth_fallback_primary"), dict) and marker.get("model"):
+        # The row holds the pre-agent auth fallback the chat ran on while its intended route's login was
+        # down. Resume ON the intended route (falling back again, re-marked, while the login is still down)
+        # instead of pinning the outage model; the endpoint and wire belong to the fallback, not that route.
+        model, provider = str(marker["model"]).strip(), str(marker.get("provider") or "").strip()
+        base_url = api_mode = ""
     if model:
         # Same dict-shaped override live /model switches use, so a DB-restored session keeps custom endpoint
         # metadata across resume and rebuilds (/new). Raw api_key is never persisted/restored.
@@ -224,6 +230,10 @@ def _persist_live_session_runtime(session: dict | None) -> None:
             model_config["composer_override_profile"] = composer_profile
         elif "composer_override_profile" in session:
             model_config.pop("composer_override_profile", None)
+        if isinstance(fallback_primary := session.get("auth_fallback_primary"), dict):
+            model_config["auth_fallback_primary"] = fallback_primary
+        else:
+            model_config.pop("auth_fallback_primary", None)
         if (tier_override := session.get("create_service_tier_override")) is not None:
             # agent.service_tier is None for explicit normal; without this the distinction is erased on every persist.
             model_config["service_tier"] = tier_override or "normal"
@@ -686,6 +696,9 @@ def _make_agent(
     if fallback_notice:
         # Emitted once on the first successful reply via _emit_pending_fallback_notice -> status_callback.
         agent._pending_fallback_notice = fallback_notice
+        # The attach sites read this: the intended route never resolved, so the turn-start restore (not
+        # restore_primary_runtime, whose snapshot IS the fallback) must keep retrying it.
+        agent._built_on_auth_fallback = True
     return agent
 
 

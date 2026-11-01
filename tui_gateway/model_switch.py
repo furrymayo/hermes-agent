@@ -353,11 +353,17 @@ def _apply_model_switch(
         profile_model, profile_provider = _config_model_target()
         session["composer_override_profile"] = {
             "model": profile_model, "provider": profile_provider}
+    pins_session = pin_session_override and isinstance(session, dict) and not one_turn
+    # An explicit pick ends an outage chat's wait for its configured primary (popped before the commit
+    # persists the row, so a resume honours the pick); ``--once`` is not a choice of model.
+    fallback_primary = session.pop("auth_fallback_primary", None) if pins_session else None
     try:
         if agent:
             # Provenance must exist before this transaction persists the switched runtime.
             _commit_agent_switch(sid, session, agent, result, current_model, restore_snapshot)
     except Exception:
+        if fallback_primary is not None:
+            session["auth_fallback_primary"] = fallback_primary
         if records_composer_override:
             if had_composer_profile:
                 session["composer_override_profile"] = previous_composer_profile
@@ -367,7 +373,7 @@ def _apply_model_switch(
     # PER-SESSION override so a rebuild of THIS session (/new, resume) re-derives the model.
     # Deliberately NOT written to process-global env (HERMES_MODEL & co.): the desktop hosts
     # every same-profile session in one process, so os.environ would leak the switch to all.
-    if pin_session_override and isinstance(session, dict) and not one_turn:
+    if pins_session:
         session["model_override"] = {
             "model": result.new_model, "provider": result.target_provider,
             "base_url": result.base_url, "api_key": result.api_key, "api_mode": result.api_mode}
@@ -503,6 +509,44 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
         render_notification(
             lambda: _emit("error", sid, {"message": f"Could not switch to configured model {model}: {e}"}),
             platform="tui", user_config=getattr(session.get("agent"), "_notification_config", None))
+
+
+def _restore_auth_fallback_primary(sid: str, session: dict) -> None:
+    """A chat built on the pre-agent auth fallback returns to the route it intended to run on (its
+    ``model_override`` pick, else the configured model) once that route's login works. Runs before the
+    config sync, whose baseline already names that route. Quiet while the credentials still fail or the
+    probe breaks: the marker stays and the next turn retries; this step never shows the user an error."""
+    marker = session.get("auth_fallback_primary")
+    if not isinstance(marker, dict) or not marker.get("model") or (agent := session.get("agent")) is None:
+        return
+    model, provider = str(marker["model"]), str(marker.get("provider") or "")
+    from hermes_cli.auth import AuthError
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    try:
+        resolve_runtime_provider(requested=provider or None, target_model=model)
+    except AuthError:
+        return
+    except Exception:
+        logger.debug("auth fallback primary probe failed for session %s", sid, exc_info=True)
+        return
+    # Popped before the switch so its commit persists the row without the marker.
+    session.pop("auth_fallback_primary")
+    old_model, old_provider = getattr(agent, "model", ""), getattr(agent, "provider", "")
+    if model == old_model and (not provider or provider == old_provider):
+        _persist_live_session_runtime(session)
+        return
+    raw = f"{model} --provider {provider}" if provider else model
+    try:
+        _apply_model_switch(
+            sid, session, raw, confirm_expensive_model=True, pin_session_override=False,
+            persist_override=False, count_switch=False)
+    except Exception as e:
+        session["auth_fallback_primary"] = marker
+        logger.warning("Primary model %s could not be restored for session %s: %s", model, sid, e, exc_info=True)
+        return
+    _emit("notice", sid, {"message": (
+        f"✅ Primary model restored: {getattr(agent, 'model', model)} via {getattr(agent, 'provider', provider)}; "
+        f"this chat was on {old_model} via {old_provider} while it was unavailable.")})
 
 
 def _pending_switch_selection_warning(model: str, provider: str, agent: Any = None) -> str | None:

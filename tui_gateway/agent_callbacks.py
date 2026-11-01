@@ -578,6 +578,17 @@ def _rebuild_session_agent(sid: str, session: dict, **kwargs):
             # their old owner, and the reapers' notify keepalive (and close's kill set) match on it.
             if inherited := set(getattr(old_agent, "_process_owner_task_ids", ())):
                 agent._process_owner_task_ids = {*inherited, *getattr(agent, "_process_owner_task_ids", ())}
+            # Same marker rule as _attach_built_agent: a replacement built on the pre-agent auth fallback
+            # remembers the route it intended to run on for the turn-start restore.
+            if getattr(agent, "_built_on_auth_fallback", False):
+                override = session.get("model_override")
+                if isinstance(override, dict) and override.get("model"):
+                    model, provider = str(override["model"]), str(override.get("provider") or "")
+                else:
+                    model, provider = config_model_seen
+                session["auth_fallback_primary"] = {"model": model, "provider": provider}
+            else:
+                session.pop("auth_fallback_primary", None)
             session.update(agent=agent, config_model_seen=config_model_seen)
             owned = opened or bool(getattr(old_agent, "_owns_session_db", False))
             if owned and _transfer_db_to_agent(agent, session_db):

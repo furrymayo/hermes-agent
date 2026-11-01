@@ -176,6 +176,17 @@ def _attach_built_agent(sid: str, current: dict, agent) -> bool:
     _session_todo_state(current)
     # Baseline for the per-turn config sync (profile home override still active).
     current["config_model_seen"] = _config_model_target()
+    # Built on the pre-agent auth fallback: remember the route the chat INTENDED to run on (its pinned
+    # override, else the configured model) so the turn-start restore returns there once its login works.
+    if getattr(agent, "_built_on_auth_fallback", False):
+        override = current.get("model_override")
+        if isinstance(override, dict) and override.get("model"):
+            model, provider = str(override["model"]), str(override.get("provider") or "")
+        else:
+            model, provider = current["config_model_seen"]
+        current["auth_fallback_primary"] = {"model": model, "provider": provider}
+    else:
+        current.pop("auth_fallback_primary", None)
     return True
 
 
