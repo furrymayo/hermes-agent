@@ -8,7 +8,9 @@ adapter) and the TUI notification poller only watched process completions.
 
 These tests cover the delivery half that now lives in tui_gateway/server.py:
 ``_collect_kanban_notifications`` (cursor claim + formatting + archive-only
-unsubscribe) and ``_format_kanban_event_text``.
+unsubscribe) and ``_format_kanban_event_text``, and the poller loop above them,
+which wakes the agent only for a ``notify+wake`` / ``wake`` subscription: the
+TUI/Desktop auto-subscribe is plain ``notify`` and gets the status line alone.
 """
 
 from types import SimpleNamespace
@@ -29,14 +31,19 @@ def _session(key: str = SESSION_KEY) -> dict:
     return {"session_key": key}
 
 
-def _create_subscribed_task(*, chat_id: str = SESSION_KEY, platform: str = "tui"):
+def _create_subscribed_task(*, chat_id: str = SESSION_KEY, platform: str = "tui", delivery_mode: str | None = None):
     conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="notify tui", assignee="worker")
-        kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
+        kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id, delivery_mode=delivery_mode)
         return tid
     finally:
         conn.close()
+
+
+def _texts(session: dict) -> list:
+    """The claimed event texts, without the per-subscription wake verdict."""
+    return [text for text, _wake in _collect_kanban_notifications(session)]
 
 
 def _complete(tid: str, summary: str = "all done") -> None:
@@ -62,7 +69,7 @@ class TestCollectKanbanNotifications:
         kb.create_board("second-board")
 
         with patch.object(kbc, "connect", wraps=kbc.connect) as spy_connect:
-            texts = _collect_kanban_notifications(_session())
+            texts = _texts(_session())
 
         assert texts == []
         spy_connect.assert_not_called()
@@ -71,7 +78,7 @@ class TestCollectKanbanNotifications:
         tid = _create_subscribed_task()
         _complete(tid, summary="shipped the fix")
 
-        first = _collect_kanban_notifications(_session())
+        first = _texts(_session())
 
         assert len(first) == 1
         assert tid in first[0]
@@ -95,7 +102,7 @@ class TestCollectKanbanNotifications:
         finally:
             conn.close()
 
-        reopened = _collect_kanban_notifications(_session())
+        reopened = _texts(_session())
 
         assert len(reopened) == 2
         assert "ready" in reopened[0]
@@ -126,7 +133,7 @@ class TestCollectKanbanNotifications:
             conn.close()
 
         with patch.object(kbc, "connect", wraps=kbc.connect) as spy_connect:
-            first = _collect_kanban_notifications(_session())
+            first = _texts(_session())
             second = _collect_kanban_notifications(_session())
 
         assert len(first) == 1
@@ -148,7 +155,7 @@ class TestCollectKanbanNotifications:
         _complete(tid)
 
         with patch.object(kbc, "connect", wraps=kbc.connect) as spy_connect:
-            texts = _collect_kanban_notifications(_session())
+            texts = _texts(_session())
 
         assert texts == []
         spy_connect.assert_not_called()
@@ -162,7 +169,7 @@ class TestCollectKanbanNotifications:
         _complete(tid)
 
         with patch.object(kbc, "connect", wraps=kbc.connect) as spy_connect:
-            texts = _collect_kanban_notifications(_session())
+            texts = _texts(_session())
 
         assert texts == []
         spy_connect.assert_not_called()
@@ -179,7 +186,7 @@ class TestCollectKanbanNotifications:
 
         monkeypatch.setattr(kbn, "count_notify_subs", fail_probe)
         with patch.object(kbc, "connect", wraps=kbc.connect) as spy_connect:
-            texts = _collect_kanban_notifications(_session())
+            texts = _texts(_session())
 
         assert len(texts) == 1
         assert tid in texts[0]
@@ -220,7 +227,7 @@ class TestCollectKanbanNotifications:
         # active while the poller collects (as a profile-bound RPC would set).
         token = set_hermes_home_override(str(other_profile_home))
         try:
-            texts = _collect_kanban_notifications(session)
+            texts = _texts(session)
         finally:
             reset_hermes_home_override(token)
 
@@ -304,7 +311,7 @@ class TestNotificationPollerLoopKanbanWiring:
         }
 
     def test_idle_session_gets_status_update_and_agent_turn(self, monkeypatch):
-        tid = _create_subscribed_task()
+        tid = _create_subscribed_task(delivery_mode="notify+wake")
         _complete(tid, summary="poller e2e done")
         session = self._poller_session(running=False)
 
@@ -323,7 +330,7 @@ class TestNotificationPollerLoopKanbanWiring:
         assert not session.get("_kanban_pending")
 
     def test_busy_session_buffers_then_flushes_when_idle(self, monkeypatch):
-        tid = _create_subscribed_task()
+        tid = _create_subscribed_task(delivery_mode="notify+wake")
         _complete(tid, summary="buffered while busy")
         session = self._poller_session(running=True)
 
@@ -348,3 +355,34 @@ class TestNotificationPollerLoopKanbanWiring:
         assert any(tid in text for text in submits), submits
         assert session["_kanban_pending"] == []
         assert session["running"] is True
+
+    def test_notify_subscription_gets_the_status_line_without_an_agent_turn(self, monkeypatch):
+        """The TUI/Desktop auto-subscribe is stored as ``notify``: the update shows up in the chat, but
+        no synthetic turn re-sends the whole conversation to the model (47 of 116 automatic calls in
+        one chat were these turns)."""
+        from tui_gateway import server
+
+        tid = _create_subscribed_task()  # column default: notify
+        _complete(tid, summary="passive delivery")
+        session = self._poller_session(running=False)
+        polls: list = []
+        collect = server._collect_kanban_notifications
+        monkeypatch.setattr(server, "_collect_kanban_notifications", lambda s: polls.append(1) or collect(s))
+
+        stop, thread, emits, submits = self._start_poller(session, monkeypatch)
+        try:
+            assert self._wait_for(lambda: any(e == "status.update" for e, _ in emits))
+            polled = len(polls)
+            # Several more poll ticks: an event that was going to wake the agent would have by now.
+            assert self._wait_for(lambda: len(polls) >= polled + 5)
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        status_texts = [p["text"] for e, p in emits if e == "status.update" and p]
+        assert any(tid in t and "passive delivery" in t for t in status_texts), status_texts
+        assert submits == []
+        assert not session.get("_kanban_pending")
+        assert session["running"] is False
+        # Claimed exactly once: the retained subscription does not replay the event.
+        assert _texts(_session()) == []
